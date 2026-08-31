@@ -1,110 +1,100 @@
+import os
+import json
+import asyncio
+from aiohttp import web
 import discord
 from discord.ext import commands
-from aiohttp import web
-import datetime
-import uuid
-import json
-import os
-import asyncio
 
-# --- CONFIGURATION ---
-PREFIX = "!"
-BOT_TOKEN = "MTU0Mzk3MzA5NjE1MzY4MjA5MQ.G-3abk.7iFV_H47EBhW6szB_6RZvrmLT89wLIqXbDw9Ok" 
-API_PORT = 8080
-KEYS_FILE = "keys.json"
+# ---------------------------------------------------------
+# SETUP & CONFIGURATION
+# ---------------------------------------------------------
+# Reads token from environment variable set in Render dashboard
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# --- INTENTS ---
+# Setup Discord bot client with basic intents
 intents = discord.Intents.default()
 intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+# Temporary local key storage (JSON fallback)
+KEYS_FILE = "keys.json"
 
 def load_keys():
     if os.path.exists(KEYS_FILE):
-        with open(KEYS_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(KEYS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
-def save_keys(keys_data):
+def save_keys(keys):
     with open(KEYS_FILE, "w") as f:
-        json.dump(keys_data, f, indent=4)
+        json.dump(keys, f, indent=4)
 
-@bot.command(name="DM")
-async def generate_key(ctx, duration_str: str = None):
-    if not duration_str:
-        await ctx.send("Usage: `!DM <1H|5H|12H|24H>`")
-        return
+keys_db = load_keys()
 
-    durations = {"1H": 1, "5H": 5, "12H": 12, "24H": 24}
-    unit = duration_str.upper()
+# ---------------------------------------------------------
+# DISCORD BOT EVENTS & COMMANDS
+# ---------------------------------------------------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user.name} ({bot.user.id})")
+    print("Discord Bot is online and ready!")
+
+@bot.command(name="generatekey")
+@commands.has_permissions(administrator=True)
+async def generate_key(ctx, key_name: str):
+    """Generates a key for Roblox authentication."""
+    keys_db[key_name] = {"valid": True, "created_by": str(ctx.author)}
+    save_keys(keys_db)
+    await ctx.send(f"Key `{key_name}` generated successfully!")
+
+# ---------------------------------------------------------
+# AIOHTTP WEB SERVER (ROBLOX KEY API)
+# ---------------------------------------------------------
+async def handle_root(request):
+    """Health check route for Render."""
+    return web.Response(text="Aetherius Key System API is running online!")
+
+async def handle_verify_key(request):
+    """API endpoint for Roblox script to verify keys."""
+    key = request.query.get("key", None)
     
-    if unit not in durations:
-        await ctx.send("Invalid duration! Use `1H`, `5H`, `12H`, or `24H`.")
-        return
+    if not key:
+        return web.json_response({"success": False, "message": "No key provided"}, status=400)
+    
+    if key in keys_db and keys_db[key].get("valid", False):
+        return web.json_response({"success": True, "message": "Key is valid!"})
+    else:
+        return web.json_response({"success": False, "message": "Invalid or expired key"}, status=403)
 
-    hours = durations[unit]
-    key_code = f"AETHERIUS-{uuid.uuid4().hex[:8].upper()}"
-    expire_timestamp = (datetime.datetime.utcnow() + datetime.timedelta(hours=hours)).timestamp()
-
-    keys = load_keys()
-    keys[key_code] = {
-        "expires_at": expire_timestamp,
-        "claimed_user": None,
-        "duration": unit
-    }
-    save_keys(keys)
-
-    try:
-        embed = discord.Embed(title="Aetherius X - Key Generated", color=0x00C3FF)
-        embed.add_field(name="Key", value=f"`{key_code}`", inline=False)
-        embed.add_field(name="Duration", value=unit, inline=True)
-        embed.set_footer(text="Locks to the first Roblox account that redeems it.")
-        await ctx.author.send(embed=embed)
-        await ctx.send(f"✅ Key sent to your DMs, {ctx.author.mention}!")
-    except discord.Forbidden:
-        await ctx.send(f"❌ Could not DM you, {ctx.author.mention}. Enable DMs in Privacy Settings.")
-
-async def handle_verify(request):
-    key = request.query.get("key")
-    user_id = request.query.get("user_id")
-
-    if not key or not user_id:
-        return web.json_response({"valid": False, "reason": "Missing key or user_id parameters"}, status=400)
-
-    keys = load_keys()
-    now = datetime.datetime.utcnow().timestamp()
-
-    if key not in keys:
-        return web.json_response({"valid": False, "reason": "Invalid Key"})
-
-    key_info = keys[key]
-
-    if now > key_info["expires_at"]:
-        del keys[key]
-        save_keys(keys)
-        return web.json_response({"valid": False, "reason": "Key has expired"})
-
-    if key_info["claimed_user"] is None:
-        key_info["claimed_user"] = str(user_id)
-        save_keys(keys)
-    elif key_info["claimed_user"] != str(user_id):
-        return web.json_response({"valid": False, "reason": "Key bound to another Roblox account"})
-
-    return web.json_response({
-        "valid": True,
-        "expires_at": key_info["expires_at"],
-        "claimed_user": key_info["claimed_user"]
-    })
-
-async def main():
+async def start_web_server():
+    """Starts the web server on the PORT provided by Render environment."""
     app = web.Application()
-    app.router.add_get("/verify", handle_verify)
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/verify", handle_verify_key)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", API_PORT)
+    
+    # Render assigns dynamic port numbers via os.getenv("PORT")
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"[API] Server live on port {API_PORT}")
-    await bot.start(BOT_TOKEN)
+    print(f"Web API server running on port {port}")
+
+# ---------------------------------------------------------
+# MAIN ASYNC RUNNER
+# ---------------------------------------------------------
+async def main():
+    if not DISCORD_TOKEN:
+        print("ERROR: DISCORD_TOKEN environment variable not set.")
+        return
+
+    # Run both the web server and the Discord bot on the same event loop
+    await start_web_server()
+    await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
